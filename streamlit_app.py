@@ -1,45 +1,38 @@
 """
-Improved product label generator for Streamlit.
+Elect Nano Product Label Generator
 
-This version addresses a number of issues present in the original implementation:
+This Streamlit application generates product labels with GS1 DataMatrix barcodes
+overlaid on a PDF template. Users can upload a custom background template or
+use the default provided template bundled with the app.
 
-* It avoids hard‑coded paths by allowing the user to upload a background
-  template PDF or falling back to a default file bundled alongside this module.
-* Dates are handled using ``datetime.date`` and ``dateutil.relativedelta`` to
-  safely add years (even across leap years).
-* The GS1 data string is still assembled manually, but the barcode itself is
-  generated with the ``treepoem`` library, which understands GS1 DataMatrix
-  encoding and inserts FNC1 and group separator characters automatically【929797942533156†L1184-L1198】.
-* The Data Matrix barcode is converted to a PIL image and inserted into the
-  overlay using ``reportlab``'s ``drawImage`` method; this is the
-  recommended way to embed images in a PDF and benefits from ReportLab's
-  internal caching【768376622927165†L681-L692】.
-* Temporary files and intermediate SVG manipulations are eliminated to reduce
-  complexity and potential resource leaks.
-* The creation of the label PDF is cached so repeated requests with the same
-  inputs do not regenerate the file unnecessarily.
-* Unused imports from the original script have been removed.
+The GS1 barcode data is constructed according to GS1 application identifiers,
+and the barcode is rendered using the treepoem library, ensuring correct
+encoding of FNC1 and group separator characters.
 
-To run this module you will need to add the following packages to your
-``requirements.txt``: ``streamlit``, ``reportlab``, ``PyPDF2``, ``treepoem``,
-``Pillow``, and ``python-dateutil``.
+Requirements:
+- streamlit
+- reportlab
+- PyPDF2
+- treepoem
+- Pillow
+- python-dateutil
+
+Ghostscript must be installed on the system for treepoem to function correctly.
 """
 
 from __future__ import annotations
 
-import base64
-import os
+import re
 from datetime import date
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
-import re
+
 import streamlit as st
-from dateutil.relativedelta import relativedelta
 from PyPDF2 import PdfReader, PdfWriter
-from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas
 from streamlit_pdf_viewer import pdf_viewer
 
 try:
@@ -51,135 +44,236 @@ except ImportError as exc:  # pragma: no cover
     ) from exc
 
 
-def sanitize_lot_code(lot_code):
-    """Remove invalid characters per GS1 CSET 82 rules (AI 10)."""
+def sanitize_lot_code(lot_code: str) -> str:
+    """
+    Sanitize the lot code string by removing characters not allowed in GS1 AI 10.
+
+    GS1 CSET 82 rules for AI 10 allow uppercase letters, digits, hyphen, period, and slash.
+
+    Parameters
+    ----------
+    lot_code : str
+        The raw lot code input.
+
+    Returns
+    -------
+    str
+        Sanitized lot code containing only valid characters.
+    """
     return re.sub(r'[^A-Z0-9\-\.\/]', '', lot_code.upper())
 
+
 def sanitize_gs1_text(text: str) -> str:
-    """Sanitize text for GS1 fields by uppercasing and removing disallowed characters."""
+    """
+    Sanitize text for GS1 fields by uppercasing and removing disallowed characters.
+
+    Allowed characters include uppercase letters, digits, hyphen, period, slash, and space.
+    This matches typical GS1 encoding character sets for textual fields.
+
+    Parameters
+    ----------
+    text : str
+        Raw input text.
+
+    Returns
+    -------
+    str
+        Sanitized text suitable for GS1 encoding.
+    """
     return re.sub(r'[^A-Z0-9\-\.\/ ]', '', text.upper())
+
+
+def sanitize_ai91_text(text: str) -> str:
+    """
+    Sanitize text specifically for GS1 AI 91 (company internal information).
+
+    Allowed characters are uppercase letters, digits, hyphen, period, and slash.
+    The result is truncated to 40 characters as per GS1 AI 91 length restrictions.
+
+    Parameters
+    ----------
+    text : str
+        Raw input text.
+
+    Returns
+    -------
+    str
+        Sanitized and truncated text suitable for GS1 AI 91.
+    """
+    sanitized = re.sub(r'[^A-Z0-9\-\.\/]', '', text.upper())
+    return sanitized[:40]
+
 
 def build_gs1_string(
     gtin14: str,
     lot: str,
     mfg: date,
-    exp: date,
-    quantity_kg: float,
-    mfr_loc: str,
     country_code: str,
-    product_name: str,
     sku: str,
+    cust_po: str,
+    cust_part: str,
+    revision: str,
+    note: str,
+    quantity: int,
 ) -> str:
-    """Assemble a GS1 application identifier string.
+    """
+    Assemble a GS1 application identifier string for encoding in the DataMatrix barcode.
 
-    This helper builds the data portion for a GS1 DataMatrix.  Each field is
-    prefaced with its appropriate application identifier.  The weight is
-    encoded in kilograms with three decimal places (as required by AI 3103).
+    Each field is prefixed with its GS1 application identifier (AI) code.
 
     Parameters
     ----------
-    gtin14:
-        The 14‑digit Global Trade Item Number.
-    lot:
-        Lot or batch number (AI 10).
-    mfg:
-        Manufacturing date.  Encoded as YYMMDD with AI 11.
-    exp:
-        Expiry date.  Encoded as YYMMDD with AI 17.
-    quantity_kg:
-        Net weight in kilograms.
-    mfr_loc:
-        Internal manufacturer location code (used with AI 91).
-    country_code:
-        Three‑digit country code for country of origin (AI 422).  Use '840' for
-        the United States.
-    product_name:
-        Product name (AI 92).
-    sku:
+    gtin14 : str
+        14-digit Global Trade Item Number.
+    lot : str
+        Lot or batch number (AI 10).
+    mfg : date
+        Manufacturing date (AI 11), encoded as YYMMDD.
+    country_code : str
+        Three-digit country code of origin (AI 422).
+    sku : str
         SKU (AI 21).
+    cust_po : str
+        Customer PO Number (AI 400).
+    cust_part : str
+        Customer Part Number (AI 7021).
+    revision : str
+        Revision number (AI 7022).
+    note : str
+        Note (AI 91).
+    quantity : int
+        Quantity (AI 30), zero-padded to 5 digits.
 
     Returns
     -------
     str
-        The concatenated GS1 data string.
+        Concatenated GS1 data string ready for barcode encoding.
     """
     mfg_str = mfg.strftime("%y%m%d")
-    exp_str = exp.strftime("%y%m%d")
-    # Weight with 3 decimal places (AI 3103) – multiply by 1000 and zero‑pad to six digits
-    weight_str = f"{int(round(quantity_kg * 1000)):06d}"
-    product_name_sanitized = sanitize_gs1_text(product_name)
     sku_sanitized = sanitize_gs1_text(sku)
+    cust_po_sanitized = sanitize_gs1_text(cust_po)
+    cust_part_sanitized = sanitize_gs1_text(cust_part)
+    revision_sanitized = sanitize_gs1_text(revision)
+    qty_str = f"{quantity:05d}"
     return (
         f"(01){gtin14}"
-        f"(3103){weight_str}"
+        f"(30){qty_str}"
         f"(11){mfg_str}"
-        f"(17){exp_str}"
         f"(422){country_code}"
         f"(10){lot}"
         f"(21){sku_sanitized}"
-        f"(91){mfr_loc}"
-        f"(92){product_name_sanitized}"
+        f"(400){cust_po_sanitized}"
+        f"(7021){cust_part_sanitized}"
+        f"(7022){revision_sanitized}"
+        f"(91){note}"
     )
 
 
 def generate_barcode_image(gs1_data: str) -> "PIL.Image.Image":
-    """Generate a GS1 DataMatrix as a PIL image.
+    """
+    Generate a GS1 DataMatrix barcode as a PIL Image.
 
-    Uses ``treepoem`` to render the barcode.  The ``parsefnc`` option
-    automatically inserts FNC1 and group‑separator characters into the Data
-    Matrix【929797942533156†L1184-L1198】.
+    Uses the treepoem library to render the barcode with correct GS1 formatting,
+    automatically inserting FNC1 and group separator characters.
+
+    Parameters
+    ----------
+    gs1_data : str
+        The GS1 data string to encode.
+
+    Returns
+    -------
+    PIL.Image.Image
+        The generated barcode image in RGB mode.
     """
     barcode = treepoem.generate_barcode(
         barcode_type="gs1datamatrix",
         data=gs1_data,
         options={"parsefnc": True},
     )
-    # Convert to RGB so ReportLab can embed it
     return barcode.convert("RGB")
 
 
 @st.cache_data(show_spinner=False)
 def render_label(
-    name: str,
     sku: str,
-    net_weight: float,
     lot_code: str,
     mfg_date: date,
-    exp_date: date,
     coo_display: str,
     background_bytes: bytes,
     gs1_data: str,
+    cust_part: str,
+    revision: str,
+    cust_po: str,
+    note: str,
+    quantity: int,
 ) -> bytes:
-    """Build the final PDF with text and barcode on top of the template.
+    """
+    Render the final product label PDF by overlaying text and barcode onto the background template.
 
-    All numerical coordinates are given in millimetres and converted to points
-    using ReportLab's mm unit【184307715199743†L86-L99】.  The resulting PDF is returned
-    as raw bytes.  Caching avoids regenerating identical labels.
+    Coordinates are specified in millimeters and converted to points for ReportLab.
+    The overlay PDF is merged with the background template PDF to produce the final output.
+
+    Parameters
+    ----------
+    sku : str
+        Resin SKU.
+    lot_code : str
+        Sanitized lot code.
+    mfg_date : date
+        Manufacturing date.
+    coo_display : str
+        Country of origin display name.
+    background_bytes : bytes
+        Raw bytes of the background PDF template.
+    gs1_data : str
+        GS1 encoded data string for barcode.
+    cust_part : str
+        Customer part number.
+    revision : str
+        Revision number.
+    cust_po : str
+        Customer PO number.
+    note : str
+        Note text.
+    quantity : int
+        Quantity value.
+
+    Returns
+    -------
+    bytes
+        The rendered label as PDF bytes.
     """
     buffer = BytesIO()
     overlay_packet = BytesIO()
-    # Label size: 152.5 mm × 101.6 mm
+
+    # Define label size in points (mm converted)
     page_width = 152.5 * mm
     page_height = 101.6 * mm
+
+    # Create a canvas for the overlay layer
     c = canvas.Canvas(overlay_packet, pagesize=(page_width, page_height))
 
-    # Draw fixed text
+    # Draw fixed text fields on the label at specified positions
     start_x = 5 * mm
-    start_y = 70 * mm
-    step_y = 8.5 * mm
-    font_size = 20
+    start_y = 73 * mm
+    step_y = 5.75 * mm
+    font_size = 14
     c.setFont("Helvetica", font_size)
-    c.drawString(start_x, start_y, f"NAME: {name}")
-    c.drawString(start_x, start_y - step_y, f"SKU: {sku}")
-    c.drawString(start_x, start_y - 2 * step_y, f"NET WEIGHT: {net_weight:.2f} KG")
-    c.drawString(start_x, start_y - 3 * step_y, f"LOT #: {lot_code}")
-    c.drawString(start_x, start_y - 4 * step_y, f"MFG. DATE: {mfg_date:%Y-%m-%d}")
-    c.drawString(start_x, start_y - 5 * step_y, f"COO: {coo_display}")
+    c.drawString(start_x, start_y, f"PART #: {cust_part}")
+    c.drawString(start_x, start_y - step_y, f"REV #: {revision}")
+    c.drawString(start_x, start_y - 2 * step_y, f"PO#: {cust_po}")
+    c.drawString(start_x, start_y - 3 * step_y, f"NOTE: {note[:40]}")
+    c.drawString(start_x, start_y - 4 * step_y, f"QUANTITY: {quantity}")
+    c.drawString(start_x, start_y - 5 * step_y, f"RESIN SKU: {sku}")
+    c.drawString(start_x, start_y - 6 * step_y, f"RESIN LOT #: {lot_code}")
+    c.drawString(start_x, start_y - 7 * step_y, f"MFG. DATE: {mfg_date:%Y-%m-%d}")
+    c.drawString(start_x, start_y - 8 * step_y, f"COO: {coo_display}")
 
-    # Generate and insert the Data Matrix barcode
+    # Generate the DataMatrix barcode image and embed it
     barcode_img = generate_barcode_image(gs1_data)
     barcode_reader = ImageReader(barcode_img)
-    # Position: bottom‑left corner at (122 mm, 6 mm); size 25 mm × 25 mm
+    # Position barcode at bottom-left corner with size 25mm x 25mm
     c.drawImage(
         barcode_reader,
         x=121.5 * mm,
@@ -189,7 +283,7 @@ def render_label(
     )
     c.save()
 
-    # Combine the overlay with the template
+    # Merge the overlay PDF with the background template PDF
     overlay_packet.seek(0)
     overlay_pdf = PdfReader(overlay_packet)
     base_pdf = PdfReader(BytesIO(background_bytes))
@@ -198,21 +292,32 @@ def render_label(
     page.merge_page(overlay_pdf.pages[0])
     output.add_page(page)
     output.write(buffer)
+
     return buffer.getvalue()
 
 
 def load_template(default_name: str = "Elect Nano 2025 Label Template V1.pdf") -> Optional[bytes]:
-    """Load the template PDF either from an uploaded file or packaged resource.
+    """
+    Load the PDF template from an uploaded file or fallback to a local bundled file.
 
-    If the user uploads a template using the file uploader, that file is used.
-    Otherwise, the function attempts to load a file with the given name from
-    the directory containing this script.  Returns ``None`` if no file can
-    be found.
+    Checks if a template has been uploaded and stored in session state, returning its bytes.
+    Otherwise attempts to read the default template file from the script's directory.
+
+    Parameters
+    ----------
+    default_name : str
+        Filename of the default template PDF.
+
+    Returns
+    -------
+    Optional[bytes]
+        The raw bytes of the template PDF if found, otherwise None.
     """
     uploaded = st.session_state.get("_uploaded_template")
     if uploaded is not None:
-        return uploaded.getvalue()  # type: ignore[no-any-return]
-    script_dir = Path.cwd()  # use current working directory
+        return uploaded.getvalue()
+    # Use the directory containing this script for fallback template
+    script_dir = Path(__file__).resolve().parent
     candidate = script_dir / default_name
     if candidate.exists():
         return candidate.read_bytes()
@@ -220,110 +325,123 @@ def load_template(default_name: str = "Elect Nano 2025 Label Template V1.pdf") -
 
 
 def main() -> None:
+    """
+    Main Streamlit app function to gather user input, generate the label, and display/download it.
+    """
     st.set_page_config(page_title="Product Label Generator", layout="centered")
     st.title("Elect Nano Product Label Generator from PDF Template")
 
-    # Allow template upload
+    # Allow user to upload a custom PDF template; stored in session state for reuse
     with st.expander("⚙️ Template settings", expanded=False):
         uploaded_file = st.file_uploader(
             "Optional: upload a custom background PDF (one page only)",
             type=["pdf"],
             key="template_file",
-            help="If no file is uploaded, the app will look for a bundled template named 'Elect Nano 2025 Label Template V1.pdf'.",
+            help=(
+                "If no file is uploaded, the app will look for a bundled template named "
+                "'Elect Nano 2025 Label Template V1.pdf' in the script directory."
+            ),
         )
         if uploaded_file:
-            # Store in session state so load_template can find it
             st.session_state["_uploaded_template"] = uploaded_file
             st.success("Custom template uploaded successfully.")
 
+    # Map country names to GS1 numeric codes
     country_options = {
         "United States": "840",
         "Japan": "392",
         "China": "156",
     }
-    mfr_loc_options = ["A-PCT", "B-PCT", "C-PCT", "A-SHR", "A-GTW", "A-FJI"]
 
+    # Form for label input parameters
     with st.form("label_form"):
-        raw_name = st.text_input("Product Name", value="THE TERmmINATOR™ COC")
+        sku = st.text_input("Resin SKU", value="X-MC-CO-EMI-000-01")
+        lot_num = st.text_input("Resin Lot #", value="EN-YYMM-XX")
 
-        # For GS1 encoding only
-        sanitized_name = sanitize_gs1_text(raw_name.replace(" ", ""))
-        if sanitized_name != raw_name:
-            st.warning(
-                "Product Name contains invalid characters for GS1 encoding. "
-                f"It will be encoded as:\n`{sanitized_name}`"
-            )
-
-        sku = st.text_input("SKU", value="X-MC-CO-EMI-000-01") #default SKU here
-        net_weight = st.number_input(
-            "Net Weight (kg)",
-            value=25.00,
-            step=0.01,
-            min_value=0.01,
-            format="%0.2f",
-        )
-        lot_num = st.text_input("Lot #", value="EN-YYMM-XX")
+        # Sanitize lot number to comply with GS1 AI 10 rules
         raw_lot_num = lot_num
         lot_num = sanitize_lot_code(raw_lot_num)
         if lot_num != raw_lot_num:
-            st.warning("Lot # contains invalid characters. It has been sanitized to comply with GS1 rules:\n" f"`{lot_num}`")
-        mfg_date = st.date_input("Manufacturing Date", value=date.today())
+            st.warning(
+                "Lot # contains invalid characters and has been sanitized to comply with GS1 rules:\n"
+                f"`{lot_num}`"
+            )
 
-        mfr_loc = st.selectbox("Manufacturing Location", options=mfr_loc_options, index=mfr_loc_options.index("A-GTW"))
+        mfg_date = st.date_input("Manufacturing Date", value=date.today())
+        quantity = st.number_input("Quantity", min_value=1, value=1)
         coo_display = st.selectbox("Country of Origin", options=list(country_options.keys()), index=0)
         coo_code = country_options[coo_display]
 
+        cust_po_raw = st.text_input("Customer PO Number", value="123456789")
+        cust_po = sanitize_gs1_text(cust_po_raw)
+
+        cust_part_raw = st.text_input("Customer Part Number", value="123456789")
+        cust_part = sanitize_gs1_text(cust_part_raw)
+
+        revision_raw = st.text_input("Customer Part Revision Number", value="01")
+        revision = sanitize_gs1_text(revision_raw)
+
+        note_raw = st.text_input("Note", value="Enter Note Here")
+        note = sanitize_ai91_text(note_raw)
+        if note != note_raw:
+            st.warning(
+                "Note field contains invalid characters or is too long for GS1 AI 91 encoding. "
+                f"It will be encoded as:\n`{note}`"
+            )
+
         submitted = st.form_submit_button("Generate Label")
+
+        # Prevent label generation if lot number contains invalid characters
         if submitted and lot_num != raw_lot_num:
-            st.error("Label generation stopped: Lot # contains invalid characters that are not allowed in GS1 DataMatrix (AI 10).")
+            st.error(
+                "Label generation stopped: Lot # contains invalid characters "
+                "that are not allowed in GS1 DataMatrix (AI 10)."
+            )
             return
 
-    # Only act after the form is submitted
+    # Proceed only after form submission
     if submitted:
-        # Load the background template
         bg_bytes = load_template()
         if bg_bytes is None:
             st.error(
                 "No background PDF found. Please upload a template or place the default file "
-                "named 'Elect Nano 2025 Label Template V1.pdf' in the same directory as this script."
+                "named 'Elect Nano 2025 Label Template V1.pdf' in the script directory."
             )
             return
 
-        # Compute the expiration date – add 5 years safely
-        try:
-            exp_date = mfg_date + relativedelta(years=5)
-        except Exception:
-            # As a fallback, set expiry to 5 years minus one day
-            exp_date = mfg_date + relativedelta(years=5, days=-1)
-
-        # Build the GS1 data string and render the label
+        # Build GS1 data string for barcode encoding
         gs1_data = build_gs1_string(
-            gtin14="00069766967842", #spoofed GTIN14, made using 000 USA prefix and ASCII numbers for ELECT and adding check digit
+            gtin14="00069766967842",  # Example GTIN14 with USA prefix and check digit
             lot=lot_num,
             mfg=mfg_date,
-            exp=exp_date,
-            quantity_kg=net_weight,
-            mfr_loc=mfr_loc,
             country_code=coo_code,
-            product_name=sanitized_name,
             sku=sku,
+            cust_po=cust_po,
+            cust_part=cust_part,
+            revision=revision,
+            note=note,
+            quantity=quantity,
         )
         st.code(gs1_data, language="text")
+
+        # Render the label PDF with overlay and barcode
         pdf_bytes = render_label(
-            name=raw_name,
             sku=sku,
-            net_weight=net_weight,
             lot_code=lot_num,
             mfg_date=mfg_date,
-            exp_date=exp_date,
             coo_display=coo_display,
             background_bytes=bg_bytes,
             gs1_data=gs1_data,
+            cust_part=cust_part,
+            revision=revision,
+            cust_po=cust_po,
+            note=note_raw,
+            quantity=quantity,
         )
 
         st.success("✅ Label generated successfully!")
 
-        # Offer download
+        # Provide download button for the generated PDF label
         st.download_button(
             label="📥 Download Label PDF",
             data=pdf_bytes,
@@ -331,8 +449,9 @@ def main() -> None:
             mime="application/pdf",
         )
 
-        # Display PDF in interactive viewer
+        # Display the generated PDF in an interactive viewer
         pdf_viewer(pdf_bytes, width=700, height=1000, zoom_level=1.0)
+
 
 if __name__ == "__main__":  # pragma: no cover
     main()
