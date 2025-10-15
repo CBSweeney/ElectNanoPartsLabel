@@ -445,7 +445,7 @@ def main() -> None:
         st.download_button(
             label="📥 Download Label PDF",
             data=pdf_bytes,
-            file_name=f"{sku}_{lot_num}.pdf",
+            file_name=f"{cust_po}_{cust_part}.pdf",
             mime="application/pdf",
         )
 
